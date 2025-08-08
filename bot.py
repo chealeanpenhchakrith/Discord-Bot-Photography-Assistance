@@ -1,19 +1,29 @@
-import discord  # type: ignore
-import os 
-from discord.ext import commands, tasks  # type: ignore
-from dotenv import load_dotenv  # type: ignore
-from datetime import datetime
+import os
+import asyncio
+from datetime import datetime, timedelta
 
-# Load environment variables
+import discord  # type: ignore
+from discord.ext import commands  # type: ignore
+from discord import app_commands  # type: ignore
+from dotenv import load_dotenv  # type: ignore
+
+# =========================
+# Env & constants
+# =========================
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID"))
 PHOTO_CHANNEL_ID = int(os.getenv("PHOTO_CHANNEL_ID"))
 PHOTO_RESULT_CHANNEL_ID = int(os.getenv("PHOTO_RESULT_CHANNEL_ID"))
-VOTE_EMOJI = os.getenv("VOTE_EMOJI")
+VOTE_EMOJI = os.getenv("VOTE_EMOJI")  # e.g. "🗳️" or "<:vote:1234567890>"
 REPORTER_ROLE_ID = int(os.getenv("REPORTER"))
 REPORTER_BORDEAUX_ROLE_ID = int(os.getenv("REPORTER_BORDEAUX"))
 
+DEFAULT_TIE_MINUTES = 6 * 60  # 6h
+
+# =========================
+# Intents & bot
+# =========================
 intents = discord.Intents.default()
 intents.messages = True
 intents.guilds = True
@@ -22,26 +32,244 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# =========================
+# Global state
+# =========================
 votes_open = False
-photo_start_time = None
-second_round_candidates = []
-second_round_active = False
-second_round_start_time = None
+photo_start_time: datetime | None = None
 
+tie_candidates: list[discord.Message] = []
+tie_round_active = False
+tie_round_end_time: datetime | None = None
+current_round_number = 1  # 1 = initial, 2 = tie-break
+tie_task: asyncio.Task | None = None  # single timer task
+tie_finishing = False  # guard to avoid duplicate finishes
+
+# =========================
+# Helpers
+# =========================
+def is_moderator(inter: discord.Interaction) -> bool:
+    if inter.user is None or not isinstance(inter.user, discord.Member):
+        return False
+    m: discord.Member = inter.user
+    if m.guild_permissions.manage_guild:
+        return True
+    rids = {r.id for r in m.roles}
+    return (REPORTER_ROLE_ID in rids) or (REPORTER_BORDEAUX_ROLE_ID in rids)
+
+def moderator_check():
+    def predicate(inter: discord.Interaction) -> bool:
+        return is_moderator(inter)
+    return app_commands.check(predicate)
+
+def is_image_message(msg: discord.Message) -> bool:
+    if not msg.attachments:
+        return False
+    for att in msg.attachments:
+        name = att.filename.lower()
+        if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            return True
+    return False
+
+async def add_vote_reactions_since(channel: discord.TextChannel, since: datetime):
+    async for msg in channel.history(after=since, limit=500, oldest_first=True):
+        if msg.author.bot:
+            continue
+        if is_image_message(msg):
+            try:
+                await msg.add_reaction(VOTE_EMOJI)
+            except Exception as e:
+                print(f"⚠️ add_vote_reactions error: {e}")
+
+async def tally_votes(channel: discord.TextChannel, since: datetime,
+                      only_messages: list[discord.Message] | None = None):
+    max_votes = 0
+    vote_map: dict[discord.Message, int] = {}
+
+    if only_messages is not None:
+        targets = only_messages
+    else:
+        targets = []
+        async for msg in channel.history(after=since, limit=500):
+            if msg.author.bot or not is_image_message(msg):
+                continue
+            targets.append(msg)
+
+    for msg in targets:
+        try:
+            fetched = await channel.fetch_message(msg.id)
+            count = 0
+            for r in fetched.reactions:
+                if str(r.emoji) == VOTE_EMOJI:
+                    count = r.count
+                    break
+            vote_map[fetched] = count
+            if count > max_votes:
+                max_votes = count
+        except Exception as e:
+            print(f"⚠️ tally error: {e}")
+
+    return max_votes, vote_map
+
+def fmt_duration(minutes: int) -> str:
+    h, m = divmod(minutes, 60)
+    if h and m:
+        return f"{h}h{m:02d}"
+    if h:
+        return f"{h}h"
+    return f"{m} min"
+
+async def announce_winner(winners: list[discord.Message],
+                          results_channel: discord.TextChannel,
+                          max_votes: int,
+                          is_tie_final: bool,
+                          round_number: int):
+    display_votes = max(max_votes - 1, 0)  # ignore seed reaction safely
+
+    if len(winners) == 1 and not is_tie_final:
+        w = winners[0]
+        link = f"https://discord.com/channels/{w.guild.id}/{w.channel.id}/{w.id}"
+        embed = None
+        if w.attachments:
+            for att in w.attachments:
+                if att.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                    embed = discord.Embed(title=f"📸 Photo gagnante – Round {round_number}")
+                    embed.set_image(url=att.url)
+                    break
+        await results_channel.send(
+            f"🏅 **Gagnant (Round {round_number}) !**\n"
+            f"{w.author.mention} l'emporte avec **{display_votes}** votes !\n\n"
+            f"🔗 [Voir le message original]({link})",
+            embed=embed
+        )
+        return
+
+    # Multiple winners (tie after Round 2)
+    lines = []
+    for w in winners:
+        link = f"https://discord.com/channels/{w.guild.id}/{w.channel.id}/{w.id}"
+        lines.append(f"- {w.author.mention} — **{display_votes}** votes — [Voir]({link})")
+
+    await results_channel.send("🏁 **Fin du Round 2 — Égalité persistante : gagnants ex æquo**\n" + "\n".join(lines))
+
+async def start_tie_break(candidates: list[discord.Message], minutes: int, round_number: int):
+    """Start Round 2 exactly once."""
+    global tie_candidates, tie_round_active, tie_round_end_time, votes_open, current_round_number, tie_task, tie_finishing
+
+    vote_channel = bot.get_channel(PHOTO_CHANNEL_ID)
+    results_channel = bot.get_channel(PHOTO_RESULT_CHANNEL_ID)
+    if not isinstance(vote_channel, discord.TextChannel) or not isinstance(results_channel, discord.TextChannel):
+        print("⚠️ start_tie_break: channels not found")
+        return
+
+    # Guard: if already finishing or active, don't relaunch
+    if tie_finishing:
+        print("ℹ️ tie-break finishing; ignoring duplicate start.")
+        return
+    if tie_round_active and tie_task and not tie_task.done():
+        print("ℹ️ tie-break already running; ignoring duplicate start.")
+        return
+
+    tie_candidates = candidates
+    tie_round_active = True
+    votes_open = True
+    current_round_number = round_number
+    tie_round_end_time = datetime.now() + timedelta(minutes=minutes)
+
+    # Reset reactions on candidates
+    for msg in tie_candidates:
+        try:
+            await msg.clear_reactions()
+            await msg.add_reaction(VOTE_EMOJI)
+        except Exception as e:
+            print(f"⚠️ tie reset reactions: {e}")
+
+    await results_channel.send(
+        f"⚠️ **Égalité détectée** — Lancement du **Round {round_number}** pour **{fmt_duration(minutes)}**.\n"
+        f"📢 <@&{REPORTER_ROLE_ID}> <@&{REPORTER_BORDEAUX_ROLE_ID}> Revotez avec {VOTE_EMOJI} sur les photos en lice !"
+    )
+
+    # Single timer task
+    async def _timer():
+        try:
+            now = datetime.now()
+            delay = (tie_round_end_time - now).total_seconds() if tie_round_end_time else 0
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await finish_tie_break()
+        except asyncio.CancelledError:
+            return
+
+    # Cancel any stale task just in case
+    if tie_task and not tie_task.done():
+        tie_task.cancel()
+        try:
+            await tie_task
+        except Exception:
+            pass
+    tie_task = asyncio.create_task(_timer())
+
+async def finish_tie_break():
+    """End Round 2 and announce winner(s)."""
+    global tie_round_active, votes_open, tie_candidates, tie_round_end_time, tie_task, tie_finishing
+
+    if tie_finishing:
+        return
+    tie_finishing = True  # guard start
+
+    vote_channel = bot.get_channel(PHOTO_CHANNEL_ID)
+    results_channel = bot.get_channel(PHOTO_RESULT_CHANNEL_ID)
+    if not isinstance(vote_channel, discord.TextChannel) or not isinstance(results_channel, discord.TextChannel):
+        tie_finishing = False
+        return
+
+    votes_open = False
+    tie_round_active = False
+
+    max_votes, vote_map = await tally_votes(
+        vote_channel,
+        since=photo_start_time or (datetime.now() - timedelta(days=7)),
+        only_messages=tie_candidates
+    )
+
+    if not vote_map:
+        await results_channel.send("😕 Aucun vote comptabilisé pendant le second tour.")
+    else:
+        top = [m for m, c in vote_map.items() if c == max_votes]
+        await announce_winner(top, results_channel, max_votes, is_tie_final=True if len(top) > 1 else False, round_number=2)
+
+    # cleanup
+    tie_candidates = []
+    tie_round_end_time = None
+    if tie_task and not tie_task.done():
+        tie_task.cancel()
+        try:
+            await tie_task
+        except Exception:
+            pass
+    tie_task = None
+    tie_finishing = False  # guard end
+
+# =========================
+# Events
+# =========================
 @bot.event
 async def on_ready():
+    try:
+        guild = discord.Object(id=GUILD_ID)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"✅ Slash commands synced to guild {GUILD_ID} ({len(synced)} cmds)")
+    except Exception as e:
+        print(f"⚠️ Sync error: {e}")
     print(f"{bot.user.name} connecté.")
-    photo_announcement_loop.start()
-    vote_open_test_loop.start()
-    vote_close_test_loop.start()
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
     if message.channel.id == PHOTO_CHANNEL_ID:
-        # Interdire tout message pendant la phase de vote
+        global votes_open
         if votes_open:
             try:
                 await message.delete()
@@ -55,11 +283,10 @@ async def on_message(message):
                     delete_after=10
                 )
             except Exception as e:
-                print(f"⚠️ Erreur lors de la suppression du message : {e}")
+                print(f"⚠️ delete during voting: {e}")
             return
 
-        # En dehors des votes, on autorise uniquement les messages avec image
-        if not message.attachments:
+        if not is_image_message(message):
             try:
                 await message.delete()
                 await message.channel.send(
@@ -67,143 +294,163 @@ async def on_message(message):
                     delete_after=10
                 )
             except Exception as e:
-                print(f"⚠️ Erreur suppression texte interdit : {e}")
+                print(f"⚠️ delete non-image: {e}")
             return
 
     await bot.process_commands(message)
 
+# =========================
+# Slash Commands
+# =========================
+@bot.tree.command(name="start_posting", description="Ouvrir la phase de dépôt des photos.")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@moderator_check()
+async def start_posting(inter: discord.Interaction):
+    global photo_start_time, votes_open, tie_round_active, tie_candidates, tie_round_end_time, current_round_number, tie_task, tie_finishing
+    photo_start_time = datetime.now()
+    votes_open = False
+    tie_round_active = False
+    tie_candidates = []
+    tie_round_end_time = None
+    current_round_number = 1
+    tie_finishing = False
+    if tie_task and not tie_task.done():
+        tie_task.cancel()
+        try:
+            await tie_task
+        except Exception:
+            pass
+    tie_task = None
+
+    channel = bot.get_channel(PHOTO_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        await inter.response.send_message("⚠️ Salon photo introuvable.", ephemeral=True)
+        return
+
+    await inter.response.send_message("✅ Phase **dépôt des photos** ouverte.", ephemeral=True)
+    await channel.send("📸 Vous pouvez poster vos photos **maintenant** ! (Seules les images sont autorisées ici.)")
+
+@bot.tree.command(name="open_votes", description="Ouvrir la phase de vote, ajouter les réactions sur les photos.")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@moderator_check()
+async def open_votes(inter: discord.Interaction):
+    global votes_open, current_round_number
+    if photo_start_time is None:
+        await inter.response.send_message("❌ Impossible d'ouvrir les votes : la phase de dépôt n’a pas été démarrée.", ephemeral=True)
+        return
+    if tie_round_active:
+        await inter.response.send_message("ℹ️ Second tour déjà lancé, impossible d'ouvrir de nouveaux votes.", ephemeral=True)
+        return
+
+    vote_channel = bot.get_channel(PHOTO_CHANNEL_ID)
+    if not isinstance(vote_channel, discord.TextChannel):
+        await inter.response.send_message("⚠️ Salon photo introuvable.", ephemeral=True)
+        return
+
+    current_round_number = 1
+    votes_open = True
+    await inter.response.send_message("✅ Phase **vote** ouverte. Les nouveaux posts sont désormais interdits.", ephemeral=True)
+    await vote_channel.send(
+        f"📣 <@&{REPORTER_ROLE_ID}> <@&{REPORTER_BORDEAUX_ROLE_ID}> Les **votes sont ouverts** ! "
+        f"Réagissez avec {VOTE_EMOJI}.\n⚠️ **Nouveaux posts interdits pendant la phase de vote.**"
+    )
+    await add_vote_reactions_since(vote_channel, photo_start_time)
+
+@bot.tree.command(
+    name="close_votes",
+    description="Fermer les votes. Si égalité, lance un second tour de 6h; si déjà en second tour, le clôture immédiatement et annonce."
+)
+@app_commands.describe(tie_round_minutes="Durée du second tour en minutes (défaut 360 = 6h).")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@moderator_check()
+async def close_votes(inter: discord.Interaction, tie_round_minutes: app_commands.Range[int, 1, 24*60] = DEFAULT_TIE_MINUTES):
+    global votes_open, current_round_number, tie_task
+
+    if photo_start_time is None:
+        await inter.response.send_message("❌ Impossible de fermer : aucune phase active détectée.", ephemeral=True)
+        return
+
+    vote_channel = bot.get_channel(PHOTO_CHANNEL_ID)
+    results_channel = bot.get_channel(PHOTO_RESULT_CHANNEL_ID)
+    if not isinstance(vote_channel, discord.TextChannel) or not isinstance(results_channel, discord.TextChannel):
+        await inter.response.send_message("⚠️ Salons introuvables.", ephemeral=True)
+        return
+
+    # NEW: if Round 2 is running, close it immediately
+    if tie_round_active:
+        await inter.response.send_message("⏹️ Second tour **clôturé manuellement**. Calcul des résultats…", ephemeral=True)
+        # cancel running timer and finish now
+        if tie_task and not tie_task.done():
+            tie_task.cancel()
+            try:
+                await tie_task
+            except Exception:
+                pass
+        await finish_tie_break()
+        return
+
+    # Otherwise we are closing Round 1
+    votes_open = False
+
+    # Round 1 tally
+    max_votes, vote_map = await tally_votes(vote_channel, since=photo_start_time)
+    if not vote_map:
+        await inter.response.send_message("🤷 Aucun message candidat trouvé. Rien à annoncer.", ephemeral=True)
+        return
+
+    top = [msg for msg, count in vote_map.items() if count == max_votes]
+
+    if len(top) == 1:
+        await inter.response.send_message("✅ Votes fermés. Gagnant annoncé dans le salon des résultats.", ephemeral=True)
+        await announce_winner([top[0]], results_channel, max_votes, is_tie_final=False, round_number=1)
+        return
+
+    # Tie -> launch Round 2 once
+    current_round_number = 2
+    await inter.response.send_message(
+        f"⚠️ Égalité détectée ({len(top)} photos à **{max(max_votes - 1, 0)}** votes). "
+        f"Lancement du **second tour** pour **{fmt_duration(tie_round_minutes)}**.",
+        ephemeral=True
+    )
+    await start_tie_break(top, minutes=tie_round_minutes, round_number=2)
+
+@bot.tree.command(name="status", description="Afficher l'état actuel du concours.")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+async def status(inter: discord.Interaction):
+    now = datetime.now().strftime('%A %H:%M')
+    posting = "Oui" if (photo_start_time is not None and not votes_open and not tie_round_active) else "Non"
+    voting = "Oui" if votes_open else "Non"
+    tie = "Oui" if tie_round_active else "Non"
+    until = f" (jusqu'à {tie_round_end_time.strftime('%d/%m %H:%M')})" if (tie_round_active and tie_round_end_time) else ""
+    await inter.response.send_message(
+        f"🛰️ **Statut**\n"
+        f"- Phase dépôt ouverte : **{posting}**\n"
+        f"- Votes ouverts : **{voting}**\n"
+        f"- Second tour actif : **{tie}** — Round **{current_round_number}**{until}\n"
+        f"- Heure serveur : **{now}**",
+        ephemeral=True
+    )
+
+# =========================
+# Prefix cmds (optional)
+# =========================
 @bot.command()
-async def ping(ctx):
+async def ping(ctx: commands.Context):
     await ctx.send("Pong!")
 
 @bot.command()
-async def test(ctx):
+async def test(ctx: commands.Context):
     await ctx.send(
-        f"✅ Bot fonctionnel !\n📊 État des votes : {'Ouverts' if votes_open else 'Fermés'}\n📅 Heure actuelle : {datetime.now().strftime('%A %H:%M')}")
-
-@tasks.loop(minutes=1)
-async def photo_announcement_loop():
-    global photo_start_time
-    now = datetime.now()
-    if now.hour == 17 and now.minute == 53:
-        channel = bot.get_channel(PHOTO_CHANNEL_ID)
-        if channel:
-            await channel.send("📸 Vous pouvez poster vos photos à partir de maintenant ! Vous avez jusqu'à 15h33.")
-            photo_start_time = datetime.now()
-
-@tasks.loop(minutes=1)
-async def vote_open_test_loop():
-    global votes_open
-    now = datetime.now()
-    if now.hour == 17 and now.minute == 55:
-        vote_channel = bot.get_channel(PHOTO_CHANNEL_ID)
-        if vote_channel:
-            votes_open = True
-            await vote_channel.send(
-                f"📣 <@&{REPORTER_ROLE_ID}> <@&{REPORTER_BORDEAUX_ROLE_ID}> Les votes sont ouverts ! Réagissez avec {VOTE_EMOJI} jusqu'à 15h36.\n⚠️ **Nouveaux posts interdits pendant la phase de vote.**"
-            )
-
-            if photo_start_time:
-                async for msg in vote_channel.history(after=photo_start_time, limit=200):
-                    if not msg.author.bot:
-                        try:
-                            await msg.add_reaction(VOTE_EMOJI)
-                        except Exception as e:
-                            print(f"⚠️ Erreur ajout réaction : {e}")
-
-@tasks.loop(minutes=1)
-async def vote_close_test_loop():
-    global votes_open, second_round_candidates, second_round_active, second_round_start_time
-    now = datetime.now()
-
-    # Fin du premier tour
-    if now.hour == 17 and now.minute == 58 and not second_round_active:
-        vote_channel = bot.get_channel(PHOTO_CHANNEL_ID)
-        results_channel = bot.get_channel(PHOTO_RESULT_CHANNEL_ID)
-
-        votes_open = False
-        max_votes = 0
-        vote_map = {}
-
-        if photo_start_time:
-            async for msg in vote_channel.history(after=photo_start_time, limit=200):
-                for reaction in msg.reactions:
-                    if str(reaction.emoji) == VOTE_EMOJI:
-                        vote_map[msg] = reaction.count
-                        if reaction.count > max_votes:
-                            max_votes = reaction.count
-
-        second_round_candidates = [msg for msg, count in vote_map.items() if count == max_votes]
-
-        if len(second_round_candidates) == 1:
-            winner = second_round_candidates[0]
-            await announce_winner(winner, results_channel, max_votes)
-        elif len(second_round_candidates) > 1:
-            second_round_active = True
-            second_round_start_time = datetime.now()
-            votes_open = True
-
-            await results_channel.send(
-                f"⚠️ **Égalité détectée !** Plusieurs photos ont reçu **{max_votes - 1} votes**.\n"
-                f"📢 <@&{REPORTER_ROLE_ID}> <@&{REPORTER_BORDEAUX_ROLE_ID}> Second tour en cours, vous avez **2 minutes** pour revoter !"
-            )
-
-            for msg in second_round_candidates:
-                try:
-                    await msg.clear_reactions()
-                    await msg.add_reaction(VOTE_EMOJI)
-                except Exception as e:
-                    print(f"⚠️ Erreur second tour : {e}")
-
-    # Fin du second tour
-    elif second_round_active and second_round_start_time and (now - second_round_start_time).seconds >= 120:
-        vote_channel = bot.get_channel(PHOTO_CHANNEL_ID)
-        results_channel = bot.get_channel(PHOTO_RESULT_CHANNEL_ID)
-        second_round_active = False
-        votes_open = False
-
-        max_votes = 0
-        winner = None
-
-        for msg in second_round_candidates:
-            try:
-                updated_msg = await vote_channel.fetch_message(msg.id)
-                for reaction in updated_msg.reactions:
-                    if str(reaction.emoji) == VOTE_EMOJI:
-                        if reaction.count > max_votes:
-                            max_votes = reaction.count
-                            winner = updated_msg
-            except Exception as e:
-                print(f"⚠️ Erreur second tour fetch : {e}")
-
-        if winner:
-            await announce_winner(winner, results_channel, max_votes, second_round=True)
-        else:
-            await results_channel.send("😕 Aucun gagnant même après second tour... égalité parfaite !")
-
-# Fonction pour annoncer le gagnant
-async def announce_winner(winner, results_channel, max_votes, second_round=False):
-    winner_link = f"https://discord.com/channels/{GUILD_ID}/{PHOTO_CHANNEL_ID}/{winner.id}"
-
-    embed = None
-    if winner.attachments:
-        for attachment in winner.attachments:
-            if attachment.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-                embed = discord.Embed(
-                    title="📸 Photo gagnante – Second tour" if second_round else "📸 Photo gagnante",
-                    color=0x00BFFF if second_round else 0xFFD700
-                )
-                embed.set_image(url=attachment.url)
-                break
-
-    await results_channel.send(
-        f"""🏅 **Gagnant {'(second tour)' if second_round else ''} !**
-{winner.author.mention} l'emporte avec **{max_votes - 1}** votes !
-
-🔗 [Voir le message original]({winner_link})
-""",
-        embed=embed
+        f"✅ Bot fonctionnel !\n"
+        f"📊 Votes ouverts : {'Oui' if votes_open else 'Non'}\n"
+        f"🔁 Second tour : {'Oui' if tie_round_active else 'Non'} (Round {current_round_number})\n"
+        f"📅 Heure actuelle : {datetime.now().strftime('%A %H:%M')}"
     )
 
-# Lancer le bot
-bot.run(TOKEN)
+# =========================
+# Run
+# =========================
+if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError("Missing DISCORD_TOKEN in environment.")
+    bot.run(TOKEN)
